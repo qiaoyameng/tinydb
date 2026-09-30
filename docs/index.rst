@@ -20,6 +20,7 @@ User's Guide
    intro
    getting-started
    usage
+   expressions
 
 Extending TinyDB
 ----------------

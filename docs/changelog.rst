@@ -19,6 +19,17 @@ see `semver.org <http://semver.org/>`_
           syntax (``Query()['some']['nested']['field']``) that will
           not break even when new methods are added to the ``Query`` API.
 
+Unreleased
+^^^^^^^^^^
+
+- Add :mod:`tinydb.expressions`: a limited, JSON-serializable query
+  expression format so queries can be stored and restored without
+  pickling user functions. Expressions support field paths, comparisons,
+  logical combinations and array ``any``/``all``, bind parameters
+  independently, resolve operators and custom predicates only from an
+  explicit registry and are validated for structure, nesting depth,
+  missing parameters and unknown operators when parsed
+
 v4.9.0 (2026-08-06)
 ^^^^^^^^^^^^^^^^^^^
 

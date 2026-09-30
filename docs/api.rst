@@ -92,6 +92,13 @@ details.
     :exclude-members: __weakref__
     :member-order: bysource
 
+``tinydb.expressions``
+----------------------
+
+.. automodule:: tinydb.expressions
+    :members: QueryExpression, OperatorRegistry, ExpressionError, load_query, default_registry
+    :member-order: bysource
+
 ``tinydb.operations``
 ---------------------
 
