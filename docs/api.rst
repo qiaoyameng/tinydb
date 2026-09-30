@@ -105,7 +105,7 @@ details.
 ------------------
 
 .. automodule:: tinydb.storages
-    :members: JSONStorage, MemoryStorage
+    :members: JSONStorage, JournalingJSONStorage, MemoryStorage
     :special-members:
     :exclude-members: __weakref__
 

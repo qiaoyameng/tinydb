@@ -616,7 +616,7 @@ Storage & Middleware
 Storage Types
 .............
 
-TinyDB comes with two storage types: JSON and in-memory. By
+TinyDB comes with three storage types: JSON, journaling JSON, and in-memory. By
 default TinyDB stores its data in JSON files so you have to specify the path
 where to store it:
 
@@ -627,6 +627,40 @@ To use the in-memory storage, use:
 
 >>> from tinydb.storages import MemoryStorage
 >>> db = TinyDB(storage=MemoryStorage)
+
+Crash-Safe Storage
+^^^^^^^^^^^^^^^^^^
+
+The regular :class:`~tinydb.storages.JSONStorage` overwrites the data file in
+place. If the process is killed (or the machine loses power) while a write is
+in progress, the file may be left truncated or contain invalid JSON.
+
+:class:`~tinydb.storages.JournalingJSONStorage` protects against this. Before
+the main data file is replaced, it writes the complete new state to a
+*journal* file (``<path>.journal``) together with a checksum and an explicit
+commit boundary. Every step is flushed and ``fsync``-ed immediately, so a
+write becomes durable as soon as it completes -- calling ``close()`` is not
+required. When the storage is reopened, the journal is replayed:
+
+* a journal entry whose commit boundary is missing or whose checksum fails
+  (for example because the file was truncated mid-write) is discarded, and
+* the last fully committed entry is restored into the main data file.
+
+After reopening, the database therefore contains either the previous complete
+version or the new complete version, never a partially written JSON document.
+Recovery is idempotent: once the last commit has been applied, the journal is
+removed and reopening the storage repeatedly yields the same result.
+
+Usage is identical to the regular JSON storage:
+
+>>> from tinydb.storages import JournalingJSONStorage
+>>> db = TinyDB('path/to/db.json', storage=JournalingJSONStorage)
+
+.. warning::
+    A database file may only be opened by **one writer** at a time. Opening
+    the same file from multiple processes or threads for writing may lose
+    updates or corrupt the journal. Concurrent read-only access while a
+    single writer is running is safe.
 
 .. hint::
     All arguments except for the ``storage`` argument are forwarded to the
