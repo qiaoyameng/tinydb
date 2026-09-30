@@ -1,3 +1,4 @@
+import json
 import re
 from collections.abc import Mapping
 
@@ -132,6 +133,93 @@ def test_insert_multiple_mixed_document_and_dict(db: TinyDB):
     assert ids == [1, 2]
     assert db.get(doc_id=1) == {'int': 1, 'char': 'explicit'}
     assert db.get(doc_id=2) == {'int': 2, 'char': 'auto'}
+
+
+def test_string_and_integer_doc_ids_are_distinct(db: TinyDB):
+    db.drop_tables()
+
+    assert db.insert(Document({'id_type': 'integer'}, 1)) == 1
+    assert db.insert(Document({'id_type': 'string'}, '1')) == '1'
+
+    assert db.get(doc_id=1) == Document({'id_type': 'integer'}, 1)
+    assert db.get(doc_id='1') == Document({'id_type': 'string'}, '1')
+    assert db.get(doc_ids=['1', 1]) == [
+        Document({'id_type': 'integer'}, 1),
+        Document({'id_type': 'string'}, '1'),
+    ]
+    assert db.contains(doc_id=1)
+    assert db.contains(doc_id='1')
+
+    assert db.update({'updated': True}, doc_ids=[1]) == [1]
+    assert db.get(doc_id=1)['updated'] is True
+    assert 'updated' not in db.get(doc_id='1')
+
+    query = where('id_type').exists()
+    matching = db.search(query)
+    assert query in db._query_cache
+    assert matching == [
+        Document({'id_type': 'integer', 'updated': True}, 1),
+        Document({'id_type': 'string'}, '1'),
+    ]
+    assert db.remove(doc_ids=['1']) == ['1']
+    assert query not in db._query_cache
+    assert db.get(doc_id='1') is None
+    assert db.get(doc_id=1) is not None
+
+
+def test_duplicate_string_doc_ids_are_rejected_in_batch(db: TinyDB):
+    db.drop_tables()
+
+    with pytest.raises(ValueError, match='already exists'):
+        db.insert_multiple([
+            Document({'n': 1}, 'external-id'),
+            Document({'n': 2}, 'external-id'),
+        ])
+
+    assert len(db) == 0
+
+
+def test_string_doc_id_does_not_change_legacy_numeric_key(tmpdir):
+    path = str(tmpdir.join('db.json'))
+
+    with open(path, 'w', encoding='utf-8') as handle:
+        json.dump({'_default': {'1': {'value': 'legacy'}}}, handle)
+
+    with TinyDB(path) as db:
+        document = db.get(doc_id=1)
+        assert document == Document({'value': 'legacy'}, 1)
+        assert db.get(doc_id='1') is None
+        assert db.insert(Document({'value': 'explicit'}, '1')) == '1'
+        assert db.insert({'value': 'auto'}) == 2
+
+    raw = json.loads(open(path, encoding='utf-8').read())
+    assert raw['_default'] == [
+        [1, {'value': 'legacy'}],
+        ['1', {'value': 'explicit'}],
+        [2, {'value': 'auto'}],
+    ]
+
+    with TinyDB(path) as db:
+        assert db.get(doc_id=1) == Document({'value': 'legacy'}, 1)
+        assert db.get(doc_id='1') == Document({'value': 'explicit'}, '1')
+        assert db.get(doc_id=2) == Document({'value': 'auto'}, 2)
+        assert db.insert({'value': 'reopened-auto'}) == 3
+
+    with TinyDB(path) as db:
+        assert db.get(doc_id=3) == Document({'value': 'reopened-auto'}, 3)
+
+
+def test_integer_only_table_keeps_legacy_json_object_format(tmpdir):
+    path = str(tmpdir.join('db.json'))
+
+    with open(path, 'w', encoding='utf-8') as handle:
+        json.dump({'_default': {'1': {'value': 'legacy'}}}, handle)
+
+    with TinyDB(path) as db:
+        db.update({'value': 'updated'}, doc_ids=[1])
+
+    raw = json.loads(open(path, encoding='utf-8').read())
+    assert raw['_default'] == {'1': {'value': 'updated'}}
 
 
 def test_insert_invalid_type_raises_error(db: TinyDB):

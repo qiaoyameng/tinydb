@@ -290,6 +290,11 @@ The same is possible when using ``db.insert_multiple(...)``:
     Inserting a ``Document`` with an ID that already exists will result
     in a ``ValueError`` being raised.
 
+Document IDs may also be strings, for example when using an external UUID as
+the key. String and integer IDs are matched by exact type, so ``"1"`` and
+``1`` refer to different documents. String IDs do not affect automatically
+assigned integer IDs.
+
 Updating data
 .............
 
