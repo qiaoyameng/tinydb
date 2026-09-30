@@ -16,7 +16,9 @@ from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache
 
-__all__ = ('Document', 'Table')
+__all__ = ('Document', 'DocumentId', 'Table')
+
+DocumentId = Union[int, str]
 
 
 class Document(dict):
@@ -27,7 +29,7 @@ class Document(dict):
     its ID using ``doc.doc_id``.
     """
 
-    def __init__(self, value: Mapping, doc_id: int):
+    def __init__(self, value: Mapping, doc_id: DocumentId):
         super().__init__(value)
         self.doc_id = doc_id
 
@@ -134,7 +136,7 @@ class Table:
         """
         return self._storage
 
-    def insert(self, document: Mapping) -> int:
+    def insert(self, document: Mapping) -> DocumentId:
         """
         Insert a new document into the table.
 
@@ -149,7 +151,7 @@ class Table:
         # First, we get the document ID for the new document
         if isinstance(document, self.document_class):
             # For a `Document` object we use the specified ID
-            doc_id = document.doc_id
+            doc_id = self._validate_document_id(document.doc_id)
 
             # We also reset the stored next ID so the next insert won't
             # re-use document IDs by accident when storing an old value
@@ -174,7 +176,10 @@ class Table:
 
         return doc_id
 
-    def insert_multiple(self, documents: Iterable[Mapping]) -> list[int]:
+    def insert_multiple(
+        self,
+        documents: Iterable[Mapping]
+    ) -> list[DocumentId]:
         """
         Insert multiple documents into the table.
 
@@ -191,17 +196,18 @@ class Table:
                     raise ValueError('Document is not a Mapping')
 
                 if isinstance(document, self.document_class):
+                    doc_id = self._validate_document_id(document.doc_id)
+
                     # Check if document does not override an existing document
-                    if document.doc_id in table:
+                    if doc_id in table:
                         raise ValueError(
-                            f'Document with ID {str(document.doc_id)} '
+                            f'Document with ID {str(doc_id)} '
                             f'already exists'
                         )
 
                     # Store the doc_id, so we can return all document IDs
                     # later. Then save the document with its doc_id and
                     # skip the rest of the current loop
-                    doc_id = document.doc_id
                     doc_ids.append(doc_id)
                     table[doc_id] = dict(document)
                     # Same as insert(): don't reuse this ID for later
@@ -214,12 +220,12 @@ class Table:
                 # Document inserted earlier in this batch is visible.
                 next_id = self._next_id
                 if next_id is None:
-                    if table:
-                        next_id = max(
-                            self.document_id_class(i) for i in table.keys()
-                        ) + 1
-                    else:
-                        next_id = 1
+                    numeric_ids = [
+                        doc_id for doc_id in table
+                        if isinstance(doc_id, int)
+                        and not isinstance(doc_id, bool)
+                    ]
+                    next_id = max(numeric_ids, default=0) + 1
                 self._next_id = next_id
                 doc_id = self._get_next_id()
                 doc_ids.append(doc_id)
@@ -268,7 +274,7 @@ class Table:
         # Then, only if the document matches the query, convert it
         # to the document class and document ID class.
         docs = [
-            self.document_class(doc, self.document_id_class(doc_id))
+            self.document_class(doc, self._document_id(doc_id))
             for doc_id, doc in self._read_table().items()
             if cond(doc)
         ]
@@ -309,12 +315,19 @@ class Table:
 
     @overload
     def get(
-        self, cond: Optional[QueryLike], doc_id: int, doc_ids: Optional[list] = ...
+        self,
+        cond: Optional[QueryLike],
+        doc_id: DocumentId,
+        doc_ids: Optional[list] = ...
     ) -> Optional[Document]: ...
 
     @overload
     def get(
-        self, *, cond: Optional[QueryLike] = ..., doc_id: int, doc_ids: Optional[list] = ...,
+        self,
+        *,
+        cond: Optional[QueryLike] = ...,
+        doc_id: DocumentId,
+        doc_ids: Optional[list] = ...,
     ) -> Optional[Document]: ...
 
     @overload
@@ -335,7 +348,7 @@ class Table:
     def get(
         self,
         cond: Optional[QueryLike] = None,
-        doc_id: Optional[int] = None,
+        doc_id: Optional[DocumentId] = None,
         doc_ids: Optional[list] = None
     ):
         """
@@ -355,7 +368,7 @@ class Table:
 
         if doc_id is not None:
             # Retrieve a document specified by its ID
-            raw_doc = table.get(str(doc_id), None)
+            raw_doc = table.get(doc_id, None)
 
             if raw_doc is None:
                 return None
@@ -369,11 +382,11 @@ class Table:
 
             # Since document IDs will be unique, we make it a set to ensure
             # constant time lookup
-            doc_ids_set = set(str(doc_id) for doc_id in doc_ids)
+            doc_ids_set = set(doc_ids)
 
             # Now return the filtered documents in form of list
             return [
-                self.document_class(doc, self.document_id_class(doc_id))
+                self.document_class(doc, self._document_id(doc_id))
                 for doc_id, doc in table.items()
                 if doc_id in doc_ids_set
             ]
@@ -388,7 +401,7 @@ class Table:
                 if cond(doc):
                     return self.document_class(
                         doc,
-                        self.document_id_class(doc_id_)
+                        self._document_id(doc_id_)
                     )
 
             return None
@@ -398,7 +411,7 @@ class Table:
     def contains(
         self,
         cond: Optional[QueryLike] = None,
-        doc_id: Optional[int] = None
+        doc_id: Optional[DocumentId] = None
     ) -> bool:
         """
         Check whether the database contains a document matching a query or
@@ -423,8 +436,8 @@ class Table:
         self,
         fields: Union[Mapping, Callable[[MutableMapping], None]],
         cond: Optional[QueryLike] = None,
-        doc_ids: Optional[Iterable[int]] = None,
-    ) -> list[int]:
+        doc_ids: Optional[Iterable[DocumentId]] = None,
+    ) -> list[DocumentId]:
         """
         Update all matching documents to have a given set of fields.
 
@@ -458,7 +471,7 @@ class Table:
             # determined inside the updater so it reflects the table state at
             # write time.
             requested_ids = list(doc_ids)
-            updated_ids: list[int] = []
+            updated_ids: list[DocumentId] = []
 
             def updater(table: dict):
                 # Filter to IDs that exist *before* performing any updates,
@@ -528,7 +541,7 @@ class Table:
         updates: Iterable[
             tuple[Union[Mapping, Callable[[MutableMapping], None]], QueryLike]
         ],
-    ) -> list[int]:
+    ) -> list[DocumentId]:
         """
         Update all matching documents to have a given set of fields.
 
@@ -575,7 +588,11 @@ class Table:
 
         return updated_ids
 
-    def upsert(self, document: Mapping, cond: Optional[QueryLike] = None) -> list[int]:
+    def upsert(
+        self,
+        document: Mapping,
+        cond: Optional[QueryLike] = None
+    ) -> list[DocumentId]:
         """
         Update documents, if they exist, insert them otherwise.
 
@@ -594,7 +611,9 @@ class Table:
 
         # Extract doc_id
         if isinstance(document, self.document_class) and hasattr(document, 'doc_id'):
-            doc_ids: Optional[list[int]] = [document.doc_id]
+            doc_ids: Optional[list[DocumentId]] = [
+                self._validate_document_id(document.doc_id)
+            ]
         else:
             doc_ids = None
 
@@ -620,8 +639,8 @@ class Table:
     def remove(
         self,
         cond: Optional[QueryLike] = None,
-        doc_ids: Optional[Iterable[int]] = None,
-    ) -> list[int]:
+        doc_ids: Optional[Iterable[DocumentId]] = None,
+    ) -> list[DocumentId]:
         """
         Remove all matching documents.
 
@@ -641,7 +660,7 @@ class Table:
             # removed IDs is determined inside the updater so it reflects the
             # table state at write time.
             requested_ids = list(doc_ids)
-            removed_ids: list[int] = []
+            removed_ids: list[DocumentId] = []
 
             def updater(table: dict):
                 # Filter to IDs that exist *before* performing any removals,
@@ -734,7 +753,7 @@ class Table:
         # Iterate all documents and their IDs
         for doc_id, doc in self._read_table().items():
             # Convert documents to the document class
-            yield self.document_class(doc, self.document_id_class(doc_id))
+            yield self.document_class(doc, self._document_id(doc_id))
 
     def _get_next_id(self):
         """
@@ -762,7 +781,11 @@ class Table:
             return next_id
 
         # Determine the next ID based on the maximum ID that's currently in use
-        max_id = max(self.document_id_class(i) for i in table.keys())
+        numeric_ids = [
+            doc_id for doc_id in table.keys()
+            if isinstance(doc_id, int) and not isinstance(doc_id, bool)
+        ]
+        max_id = max(numeric_ids, default=0)
         next_id = max_id + 1
 
         # The next ID we will return AFTER this call needs to be larger than
@@ -771,7 +794,7 @@ class Table:
 
         return next_id
 
-    def _read_table(self) -> dict[str, Mapping]:
+    def _read_table(self) -> dict[DocumentId, Mapping]:
         """
         Read the table data from the underlying storage.
 
@@ -796,7 +819,10 @@ class Table:
 
         return table
 
-    def _update_table(self, updater: Callable[[dict[int, Mapping]], None]):
+    def _update_table(
+        self,
+        updater: Callable[[dict[DocumentId, Mapping]], None]
+    ):
         """
         Perform a table update operation.
 
@@ -822,28 +848,52 @@ class Table:
             # The table does not exist yet, so it is empty
             raw_table = {}
 
-        # Convert the document IDs to the document ID class.
-        # This is required as the rest of TinyDB expects the document IDs
-        # to be an instance of ``self.document_id_class`` but the storage
-        # might convert dict keys to strings.
+        # Storages should preserve the Python type of document IDs.
+        # JSONStorage handles its own key encoding and legacy format
+        # decoding before data reaches this point.
         table = {
-            self.document_id_class(doc_id): doc
+            self._stored_document_id(doc_id): doc
             for doc_id, doc in raw_table.items()
         }
 
         # Perform the table update operation
         updater(table)
 
-        # Convert the document IDs back to strings.
-        # This is required as some storages (most notably the JSON file format)
-        # don't support IDs other than strings.
-        tables[self.name] = {
-            str(doc_id): doc
-            for doc_id, doc in table.items()
-        }
+        tables[self.name] = table
 
         # Write the newly updated data back to the storage
         self._storage.write(tables)
 
         # Clear the query cache, as the table contents have changed
         self.clear_cache()
+
+    def _document_id(self, doc_id: object) -> DocumentId:
+        """
+        Return a document ID using its original Python type.
+        """
+
+        if isinstance(doc_id, int) and not isinstance(doc_id, bool):
+            doc_id = self.document_id_class(doc_id)
+
+        return self._validate_document_id(doc_id)
+
+    def _stored_document_id(self, doc_id: object) -> DocumentId:
+        """
+        Normalize document IDs returned by a custom storage.
+        """
+
+        if isinstance(doc_id, int) and not isinstance(doc_id, bool):
+            return self.document_id_class(doc_id)
+
+        return doc_id
+
+    @staticmethod
+    def _validate_document_id(doc_id: object) -> DocumentId:
+        """
+        Validate an explicitly supplied document ID.
+        """
+
+        if isinstance(doc_id, bool) or not isinstance(doc_id, (int, str)):
+            raise TypeError('Document ID must be an int or a str')
+
+        return doc_id

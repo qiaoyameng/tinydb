@@ -1,3 +1,4 @@
+import json
 import re
 from collections.abc import Mapping
 
@@ -132,6 +133,154 @@ def test_insert_multiple_mixed_document_and_dict(db: TinyDB):
     assert ids == [1, 2]
     assert db.get(doc_id=1) == {'int': 1, 'char': 'explicit'}
     assert db.get(doc_id=2) == {'int': 2, 'char': 'auto'}
+
+
+def test_string_and_integer_document_ids_are_distinct(db: TinyDB):
+    db.drop_tables()
+
+    integer_id = db.insert(Document({'kind': 'integer'}, 1))
+    string_id = db.insert(Document({'kind': 'string'}, '1'))
+
+    assert integer_id == 1
+    assert string_id == '1'
+    assert len(db) == 2
+    assert db.get(doc_id=1) == {'kind': 'integer'}
+    assert db.get(doc_id='1') == {'kind': 'string'}
+    assert db.get(doc_ids=[1, '1']) == [
+        {'kind': 'integer'},
+        {'kind': 'string'},
+    ]
+    assert db.contains(doc_id=1)
+    assert db.contains(doc_id='1')
+
+    assert db.update({'updated': True}, doc_ids=[1]) == [1]
+    assert db.get(doc_id=1) == {'kind': 'integer', 'updated': True}
+    assert db.get(doc_id='1') == {'kind': 'string'}
+
+    query = where('kind') == 'string'
+    assert db.search(query) == [Document({'kind': 'string'}, '1')]
+    assert query in db._query_cache
+    assert db.update({'updated': True}, doc_ids=['1']) == ['1']
+    assert query not in db._query_cache
+    assert db.get(doc_id='1') == {'kind': 'string', 'updated': True}
+
+    assert db.remove(doc_ids=[1]) == [1]
+    assert len(db) == 1
+    assert db.get(doc_id=1) is None
+    assert db.get(doc_id='1') is not None
+
+
+def test_string_document_id_does_not_change_integer_sequence(db: TinyDB):
+    db.drop_tables()
+
+    db.insert(Document({'kind': 'string'}, 'order-uuid'))
+    assert db.insert({'kind': 'auto'}) == 1
+
+    db.insert(Document({'kind': 'string-number'}, '1'))
+    assert db.insert({'kind': 'auto'}) == 2
+
+    assert db.insert_multiple([
+        Document({'kind': 'explicit'}, 'batch-uuid'),
+        {'kind': 'auto'},
+    ]) == ['batch-uuid', 3]
+
+
+def test_duplicate_string_document_ids_are_rejected(db: TinyDB):
+    db.drop_tables()
+
+    assert db.insert(
+        Document({'kind': 'string'}, 'order-uuid')
+    ) == 'order-uuid'
+
+    with pytest.raises(ValueError, match='already exists'):
+        db.insert(Document({'kind': 'duplicate'}, 'order-uuid'))
+
+    with pytest.raises(ValueError, match='already exists'):
+        db.insert_multiple([
+            Document({'kind': 'duplicate-one'}, 'batch-uuid'),
+            Document({'kind': 'duplicate-two'}, 'batch-uuid'),
+        ])
+
+    assert len(db) == 1
+    assert db.get(doc_id='batch-uuid') is None
+
+
+def test_insert_multiple_allows_matching_key_different_types(db: TinyDB):
+    db.drop_tables()
+
+    assert db.insert_multiple([
+        Document({'kind': 'integer'}, 10),
+        Document({'kind': 'string'}, '10'),
+    ]) == [10, '10']
+    assert db.get(doc_id=10) == {'kind': 'integer'}
+    assert db.get(doc_id='10') == {'kind': 'string'}
+
+    with pytest.raises(ValueError, match='already exists'):
+        db.insert_multiple([
+            Document({'kind': 'duplicate'}, 10),
+            Document({'kind': 'duplicate'}, 10),
+        ])
+
+    assert len(db) == 2
+
+
+def test_string_and_integer_document_ids_persist(tmpdir):
+    path = str(tmpdir.join('mixed-ids.db'))
+
+    with TinyDB(path) as db:
+        db.insert(Document({'kind': 'integer'}, 1))
+        db.insert(Document({'kind': 'string'}, '1'))
+        db.insert(Document({'kind': 'uuid'}, 'order-uuid'))
+
+    with TinyDB(path) as db:
+        assert len(db) == 3
+        assert db.get(doc_id=1) == {'kind': 'integer'}
+        assert db.get(doc_id='1') == {'kind': 'string'}
+        assert db.get(doc_id='order-uuid') == {'kind': 'uuid'}
+        assert db.get(doc_ids=[1, '1', 'order-uuid']) == [
+            {'kind': 'integer'},
+            {'kind': 'string'},
+            {'kind': 'uuid'},
+        ]
+        assert db.update({'updated': True}, doc_ids=[1, '1']) == [1, '1']
+        assert db.remove(doc_ids=['order-uuid']) == ['order-uuid']
+        assert db.insert({'kind': 'auto'}) == 2
+
+    with open(path) as handle:
+        stored = json.load(handle)
+
+    assert set(stored['_default']) == {'1', '"1"', '2'}
+
+
+def test_next_integer_id_after_reopening_string_ids(tmpdir):
+    path = str(tmpdir.join('string-only-ids.db'))
+
+    with TinyDB(path) as db:
+        db.insert(Document({'kind': 'uuid'}, 'order-uuid'))
+        db.insert(Document({'kind': 'string-number'}, '1'))
+
+    with TinyDB(path) as db:
+        assert db.insert({'kind': 'auto'}) == 1
+        assert db.get(doc_id=1) == {'kind': 'auto'}
+        assert db.get(doc_id='1') == {'kind': 'string-number'}
+
+
+def test_legacy_json_numeric_keys_remain_numeric(tmpdir):
+    path = tmpdir.join('legacy.db')
+    path.write('{"_default": {"1": {"id": 1}, "7": {"id": 7}}}')
+
+    with TinyDB(str(path)) as db:
+        documents = db.all()
+        assert [document.doc_id for document in documents] == [1, 7]
+        assert db.get(doc_id=1) == {'id': 1}
+        assert db.get(doc_id='1') is None
+        assert db.insert({'id': 8}) == 8
+
+    raw_json = path.read()
+    assert '"1": {"id": 1}' in raw_json
+    assert '"7": {"id": 7}' in raw_json
+    assert '"8": {"id": 8}' in raw_json
+    assert '"\\"1\\""' not in raw_json
 
 
 def test_insert_invalid_type_raises_error(db: TinyDB):

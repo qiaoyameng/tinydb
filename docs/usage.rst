@@ -290,6 +290,18 @@ The same is possible when using ``db.insert_multiple(...)``:
     Inserting a ``Document`` with an ID that already exists will result
     in a ``ValueError`` being raised.
 
+Document IDs may also be strings. This is useful when the data already has
+an external identifier, such as a UUID:
+
+>>> db.insert(
+...     Document({'order_id': '...'}, doc_id='550e8400-e29b-41d4-a716-446655440000')
+... )
+'550e8400-e29b-41d4-a716-446655440000'
+
+String and integer IDs use their Python types literally. Thus, ``"1"`` and
+``1`` refer to two different documents. Automatically assigned IDs remain
+integers and ignore string IDs when calculating the next value.
+
 Updating data
 .............
 

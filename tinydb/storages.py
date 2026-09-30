@@ -8,9 +8,92 @@ import json
 import os
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, Optional
 
 __all__ = ('Storage', 'JSONStorage', 'MemoryStorage')
+
+
+def _encode_document_id(key: object) -> str:
+    if isinstance(key, str):
+        return json.dumps(key)
+
+    if isinstance(key, int) and not isinstance(key, bool):
+        return str(key)
+
+    raise TypeError('Document ID must be an int or a str')
+
+
+def _decode_document_id(key: object) -> object:
+    if not isinstance(key, str):
+        return key
+
+    try:
+        parsed_key = json.loads(key)
+    except (ValueError, TypeError):
+        return key
+
+    if isinstance(parsed_key, str):
+        return parsed_key
+
+    if (
+        isinstance(parsed_key, int)
+        and not isinstance(parsed_key, bool)
+        and json.dumps(parsed_key) == key
+    ):
+        return parsed_key
+
+    return key
+
+
+def _encode_table_keys(table: dict) -> dict[str, Any]:
+    return {
+        _encode_document_id(doc_id): document
+        for doc_id, document in table.items()
+    }
+
+
+def _decode_table_keys(table: dict) -> dict[Any, Any]:
+    return {
+        _decode_document_id(doc_id): document
+        for doc_id, document in table.items()
+    }
+
+
+def _encode_database_keys(data):
+    encoded = {}
+
+    for table_name, table in data.items():
+        is_document_table = (
+            isinstance(table, dict)
+            and all(
+                isinstance(document, Mapping)
+                for document in table.values()
+            )
+        )
+        encoded[table_name] = (
+            _encode_table_keys(table) if is_document_table else table
+        )
+
+    return encoded
+
+
+def _decode_database_keys(data):
+    decoded = {}
+
+    for table_name, table in data.items():
+        is_document_table = (
+            isinstance(table, dict)
+            and all(
+                isinstance(document, Mapping)
+                for document in table.values()
+            )
+        )
+        decoded[table_name] = (
+            _decode_table_keys(table) if is_document_table else table
+        )
+
+    return decoded
 
 
 def touch(path: str, create_dirs: bool):
@@ -45,7 +128,7 @@ class Storage(ABC):
     # implemented read and write
 
     @abstractmethod
-    def read(self) -> Optional[dict[str, dict[str, Any]]]:
+    def read(self) -> Optional[dict[str, dict[Any, Any]]]:
         """
         Read the current state.
 
@@ -57,7 +140,7 @@ class Storage(ABC):
         raise NotImplementedError('To be overridden!')
 
     @abstractmethod
-    def write(self, data: dict[str, dict[str, Any]]) -> None:
+    def write(self, data: dict[str, dict[Any, Any]]) -> None:
         """
         Write the current state of the database to the storage.
 
@@ -122,7 +205,7 @@ class JSONStorage(Storage):
     def close(self) -> None:
         self._handle.close()
 
-    def read(self) -> Optional[dict[str, dict[str, Any]]]:
+    def read(self) -> Optional[dict[str, dict[Any, Any]]]:
         # Get the file size by moving the cursor to the file end and reading
         # its location
         self._handle.seek(0, os.SEEK_END)
@@ -137,14 +220,14 @@ class JSONStorage(Storage):
             self._handle.seek(0)
 
             # Load the JSON contents of the file
-            return json.load(self._handle)
+            return _decode_database_keys(json.load(self._handle))
 
-    def write(self, data: dict[str, dict[str, Any]]):
+    def write(self, data: dict[str, dict[Any, Any]]):
         # Move the cursor to the beginning of the file just in case
         self._handle.seek(0)
 
         # Serialize the database state using the user-provided arguments
-        serialized = json.dumps(data, **self.kwargs)
+        serialized = json.dumps(_encode_database_keys(data), **self.kwargs)
 
         # Write the serialized data to the file
         try:
@@ -174,8 +257,8 @@ class MemoryStorage(Storage):
         super().__init__()
         self.memory = None
 
-    def read(self) -> Optional[dict[str, dict[str, Any]]]:
+    def read(self) -> Optional[dict[str, dict[Any, Any]]]:
         return self.memory
 
-    def write(self, data: dict[str, dict[str, Any]]):
+    def write(self, data: dict[str, dict[Any, Any]]):
         self.memory = data
