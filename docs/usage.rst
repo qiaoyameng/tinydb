@@ -693,6 +693,81 @@ of these ways:
     # Using the close function
     db.close()
 
+.. _storable_query_expressions:
+
+Storable Query Expressions
+--------------------------
+
+A :class:`~tinydb.queries.Query` may contain arbitrary Python functions, so
+it can't be serialized to JSON safely. For storing and restoring queries you
+can instead build a *query expression*: a plain data structure using only a
+fixed set of operators. Compile it with
+:func:`~tinydb.queryexpr.compile_query_expression` to get a regular query:
+
+.. code-block:: python
+
+    import json
+    from tinydb import compile_query_expression
+
+    expression = {
+        'op': 'and',
+        'left': {'op': 'eq', 'path': ['name'],
+                 'value': {'$param': 'name'}},
+        'right': {'op': 'ge', 'path': ['age'],
+                  'value': {'$param': 'min_age'}},
+    }
+    params = {'name': 'John', 'min_age': 21}
+
+    query = compile_query_expression(expression, params)
+    db.search(query)
+
+    # Store the expression like any other JSON document:
+    stored = json.dumps({'expression': expression, 'params': params})
+    restored = json.loads(stored)
+    query = compile_query_expression(restored['expression'],
+                                     restored['params'])
+
+The supported operators are the comparisons ``eq``, ``ne``, ``lt``, ``le``,
+``gt``, ``ge``, the unary ``not``, the combinators ``and`` and ``or``,
+``exists``, ``matches`` and ``search`` (with optional regex ``flags``),
+``one_of``, and the array operators ``any`` and ``all``. Their nested
+condition is either an expression evaluated against each element or a list
+of values, matching ``Query.any``/``Query.all``.
+
+Values are referenced independently from the expression via
+``{'$param': 'name'}`` and passed as the ``params`` mapping. Parameter values
+are copied while binding, so mutating them afterwards doesn't change the
+compiled query or its cache hash.
+
+Custom predicates must be registered explicitly on a
+:class:`~tinydb.queryexpr.PredicateRegistry`; expressions can never import
+code or address unregistered callables:
+
+.. code-block:: python
+
+    from tinydb import PredicateRegistry
+
+    predicates = PredicateRegistry()
+
+    @predicates.register
+    def divisible(value, divisor):
+        return value % divisor == 0
+
+    expression = {
+        'op': 'pred',
+        'path': ['number'],
+        'name': 'divisible',
+        'args': [{'$param': 'divisor'}],
+    }
+    query = compile_query_expression(
+        expression, {'divisor': 3}, predicates=predicates
+    )
+
+Malformed expressions raise
+:class:`~tinydb.queryexpr.InvalidQueryExpressionError`, unknown operators or
+predicates raise :class:`~tinydb.queryexpr.UnknownOperatorError`, and
+unbound parameters raise :class:`~tinydb.queryexpr.MissingParameterError`.
+
 .. _mypy_type_checking:
 
 MyPy Type Checking

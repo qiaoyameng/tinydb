@@ -92,6 +92,13 @@ details.
     :exclude-members: __weakref__
     :member-order: bysource
 
+``tinydb.queryexpr``
+---------------------
+
+.. automodule:: tinydb.queryexpr
+    :members:
+    :special-members:
+
 ``tinydb.operations``
 ---------------------
 

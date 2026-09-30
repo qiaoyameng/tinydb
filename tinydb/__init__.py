@@ -25,8 +25,28 @@ Usage example:
 """
 
 from .queries import Query, where
+from .queryexpr import (
+    compile_query_expression,
+    PredicateRegistry,
+    QueryExpressionError,
+    InvalidQueryExpressionError,
+    UnknownOperatorError,
+    MissingParameterError,
+)
 from .storages import Storage, JSONStorage
 from .database import TinyDB
 from .version import __version__
 
-__all__ = ('TinyDB', 'Storage', 'JSONStorage', 'Query', 'where')
+__all__ = (
+    'TinyDB',
+    'Storage',
+    'JSONStorage',
+    'Query',
+    'where',
+    'compile_query_expression',
+    'PredicateRegistry',
+    'QueryExpressionError',
+    'InvalidQueryExpressionError',
+    'UnknownOperatorError',
+    'MissingParameterError',
+)
