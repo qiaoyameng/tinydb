@@ -2,9 +2,15 @@
 This module contains the main component of TinyDB: the database.
 """
 
+import copy
 from collections.abc import Iterator
 
 from . import JSONStorage
+from .references import (
+    RESTRICT,
+    Reference,
+    enforce_references,
+)
 from .storages import Storage
 from .table import Table, Document
 from .utils import with_typehint
@@ -96,6 +102,7 @@ class TinyDB(TableBase):
 
         self._opened = True
         self._tables: dict[str, Table] = {}
+        self._references: list[Reference] = []
 
     def __repr__(self):
 
@@ -128,9 +135,86 @@ class TinyDB(TableBase):
             return self._tables[name]
 
         table = self.table_class(self.storage, name, **kwargs)
+
+        # Share the reference registry with the table so that it enforces
+        # constraints on every write, and register a callback that lets
+        # the table invalidate the query caches of all tables (a cascading
+        # removal or set_null reset may modify other tables).
+        table._references = self._references
+        table._on_tables_changed = self._clear_table_caches
+
         self._tables[name] = table
 
         return table
+
+    def add_reference(
+        self,
+        source_table: str,
+        field: str,
+        target_table: str,
+        on_delete: str = RESTRICT,
+    ) -> Reference:
+        """
+        Add a referential constraint between two tables.
+
+        Documents of ``source_table`` may reference the ``doc_id`` of a
+        document of ``target_table`` in ``field``. The reference is
+        optional: a missing field or a ``None`` value is always valid.
+
+        The constraint is enforced on every write against the full
+        candidate state of the database before anything is committed:
+        inserting or updating a document with a dangling reference is
+        rejected, and removing referenced documents applies the
+        ``on_delete`` behavior (``restrict``, ``set_null`` or
+        ``cascade``). A rejected operation never commits a partial
+        result to the storage.
+
+        :param source_table: the table holding the referencing field
+        :param field: the field that stores the referenced ``doc_id``
+        :param target_table: the table holding the referenced documents
+        :param on_delete: ``restrict``, ``set_null`` or ``cascade``
+        :returns: the created ``Reference``
+        """
+
+        reference = Reference(
+            source_table=source_table,
+            field=field,
+            target_table=target_table,
+            on_delete=on_delete,
+        )
+
+        if reference not in self._references:
+            self._references.append(reference)
+
+        return reference
+
+    def remove_reference(
+        self,
+        source_table: str,
+        field: str,
+        target_table: str,
+    ) -> None:
+        """
+        Remove all referential constraints matching the given tables/field.
+
+        :param source_table: the table holding the referencing field
+        :param field: the field that stores the referenced ``doc_id``
+        :param target_table: the table holding the referenced documents
+        """
+
+        self._references[:] = [
+            reference for reference in self._references
+            if (reference.source_table, reference.field,
+                reference.target_table) != (source_table, field, target_table)
+        ]
+
+    @property
+    def references(self) -> tuple[Reference, ...]:
+        """
+        Get all referential constraints of this database.
+        """
+
+        return tuple(self._references)
 
     def tables(self) -> set[str]:
         """
@@ -177,6 +261,12 @@ class TinyDB(TableBase):
         """
         Drop a specific table from the database. **CANNOT BE REVERSED!**
 
+        Dropping a table removes all of its documents, so referential
+        constraints are enforced just like for document removals: the
+        drop is rejected if a ``restrict`` constraint is violated and
+        ``set_null``/``cascade`` behaviors are applied to the
+        remaining tables.
+
         :param name: The name of the table to drop.
         """
 
@@ -195,11 +285,45 @@ class TinyDB(TableBase):
         if name not in data:
             return
 
-        # Remove the table from the data dict
-        del data[name]
+        if self._references:
+            # Enforce constraints against the full candidate state before
+            # committing. Work on a private copy so a constraint violation
+            # cannot leave partially applied changes behind (some storages
+            # hand out their internal state on read).
+            candidate = copy.deepcopy(data)
+
+            # All documents of the dropped table are removed
+            removed = [
+                (name, str(doc_id)) for doc_id in candidate[name].keys()
+            ]
+
+            # Remove the table from the candidate state
+            del candidate[name]
+
+            # Apply cascading removals / set_null resets and validate all
+            # references. Raises ReferentialIntegrityError on violations,
+            # in which case the storage is never written to.
+            enforce_references(candidate, self._references, removed)
+
+            data = candidate
+        else:
+            # Remove the table from the data dict
+            del data[name]
 
         # Store the updated data back to the storage
         self.storage.write(data)
+
+        # Tables affected by referential actions need to invalidate their
+        # query caches
+        self._clear_table_caches()
+
+    def _clear_table_caches(self) -> None:
+        """
+        Clear the query caches of all currently opened tables.
+        """
+
+        for table in self._tables.values():
+            table.clear_cache()
 
     @property
     def storage(self) -> Storage:

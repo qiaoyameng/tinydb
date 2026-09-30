@@ -101,6 +101,15 @@ details.
     :exclude-members: __weakref__
     :member-order: bysource
 
+``tinydb.references``
+-----------------------
+
+.. automodule:: tinydb.references
+    :members:
+    :special-members:
+    :exclude-members: __weakref__
+    :member-order: bysource
+
 ``tinydb.storage``
 ------------------
 

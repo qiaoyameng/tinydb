@@ -610,6 +610,47 @@ to the ``table(...)`` function:
    long-running applications that use ``lambda`` functions as a test function
    may experience memory leaks.
 
+.. _references:
+
+References
+..........
+
+TinyDB can enforce optional referential constraints between tables. A
+reference declares that a field of the documents in a source table points
+to the ``doc_id`` of a document in a target table:
+
+>>> db.add_reference('comments', 'post_id', 'posts', on_delete='cascade')
+
+The reference is optional: documents that don't contain the field or store
+``None`` in it never violate the constraint. Constraints are checked
+against the full candidate state of the database before a write is
+committed, so a rejected operation never commits a partial result and
+inserting or updating a document that points to a non-existing document
+raises a ``ReferentialIntegrityError``:
+
+>>> comments.insert({'text': 'orphan', 'post_id': 999})
+Traceback (most recent call last):
+...
+tinydb.references.ReferentialIntegrityError: Reference constraint violated: comments.post_id -> posts: document 1 references missing doc_id 999
+
+When a referenced document is removed (via ``remove``, ``truncate`` or
+``drop_table``), the ``on_delete`` behavior applies:
+
+- ``'restrict'`` (the default): the operation is rejected while references
+  to the removed documents exist,
+- ``'set_null'``: the referencing field is reset to ``None``,
+- ``'cascade'``: the referencing documents are deleted as well,
+  recursively; documents referenced by multiple sources and cyclic
+  references are processed only once.
+
+Batch inserts are validated as a whole, so documents inserted in the same
+``insert_multiple`` call may reference each other. Existing constraints
+can be inspected and removed:
+
+>>> db.references
+(Reference(source_table='comments', field='post_id', target_table='posts', on_delete='cascade'),)
+>>> db.remove_reference('comments', 'post_id', 'posts')
+
 Storage & Middleware
 --------------------
 

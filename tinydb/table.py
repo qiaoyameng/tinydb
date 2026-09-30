@@ -3,6 +3,7 @@ This module implements tables, the central place for accessing and manipulating
 data in TinyDB.
 """
 
+import copy
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from typing import (
     NoReturn,
@@ -13,6 +14,7 @@ from typing import (
 )
 
 from .queries import QueryLike
+from .references import Reference, enforce_references
 from .storages import Storage
 from .utils import LRUCache
 
@@ -106,6 +108,15 @@ class Table:
         self._name = name
         self._query_cache: LRUCache[QueryLike, list[Document]] \
             = self.query_cache_class(capacity=cache_size)
+
+        # Reference constraints this table participates in. TinyDB
+        # shares its registry with every table it creates; standalone
+        # tables simply see an empty list.
+        self._references: list[Reference] = []
+
+        # Optional callback invoked after a write so that other tables
+        # (e.g. affected by cascading removals) can invalidate their caches.
+        self._on_tables_changed: Optional[Callable[[], None]] = None
 
         self._next_id: Optional[int] = None
         if persist_empty:
@@ -816,6 +827,15 @@ class Table:
             # The database is empty
             tables = {}
 
+        if self._references:
+            # Constraints are checked against the full candidate state of
+            # the database before anything is committed. Work on a private
+            # copy from the start so that a constraint violation cannot
+            # leave partially applied changes behind (some storages, e.g.
+            # MemoryStorage, hand out their internal state on read and the
+            # updater mutates documents in place).
+            tables = copy.deepcopy(tables)
+
         try:
             raw_table = tables[self.name]
         except KeyError:
@@ -835,15 +855,36 @@ class Table:
         updater(table)
 
         # Convert the document IDs back to strings.
-        # This is required as some storages (most notably the JSON file format)
-        # don't support IDs other than strings.
+        # This is required as some storages (most notably the JSON file
+        # format) don't support IDs other than strings.
         tables[self.name] = {
             str(doc_id): doc
             for doc_id, doc in table.items()
         }
+
+        if self._references:
+            # Determine which documents this operation removed; their
+            # deletion triggers the constraints' ``on_delete`` behaviors.
+            remaining_ids = set(tables[self.name].keys())
+            removed = [
+                (self.name, str(doc_id))
+                for doc_id in raw_table.keys()
+                if str(doc_id) not in remaining_ids
+            ]
+
+            # Apply cascading removals / set_null resets and validate all
+            # references against the full candidate state. Raises
+            # ReferentialIntegrityError on violations, in which case the
+            # storage is never written to.
+            enforce_references(tables, self._references, removed)
 
         # Write the newly updated data back to the storage
         self._storage.write(tables)
 
         # Clear the query cache, as the table contents have changed
         self.clear_cache()
+
+        # Notify about the write so that other tables affected by
+        # referential actions can invalidate their caches as well
+        if self._on_tables_changed is not None:
+            self._on_tables_changed()
