@@ -2,9 +2,16 @@
 This module contains the main component of TinyDB: the database.
 """
 
+import copy
 from collections.abc import Iterator
 
 from . import JSONStorage
+from .references import (
+    RESTRICT,
+    Reference,
+    enforce_references,
+    validate_references,
+)
 from .storages import Storage
 from .table import Table, Document
 from .utils import with_typehint
@@ -96,6 +103,7 @@ class TinyDB(TableBase):
 
         self._opened = True
         self._tables: dict[str, Table] = {}
+        self._references: list[Reference] = []
 
     def __repr__(self):
 
@@ -128,6 +136,10 @@ class TinyDB(TableBase):
             return self._tables[name]
 
         table = self.table_class(self.storage, name, **kwargs)
+
+        # Give the table access to this database's referential constraints
+        table._database = self
+
         self._tables[name] = table
 
         return table
@@ -160,6 +172,76 @@ class TinyDB(TableBase):
 
         return set(self.storage.read() or {})
 
+    @property
+    def references(self) -> tuple[Reference, ...]:
+        """
+        Get the referential constraints registered on this database.
+
+        :returns: a tuple of all registered :class:`Reference` objects
+        """
+        return tuple(self._references)
+
+    def add_reference(
+        self,
+        table: str,
+        field: str,
+        ref_table: str,
+        on_delete: str = RESTRICT,
+    ) -> Reference:
+        """
+        Register a referential constraint between two tables.
+
+        Declares that ``field`` of the documents in ``table`` stores the
+        ``doc_id`` of a document in ``ref_table``. From now on, every
+        database write validates the complete candidate state against all
+        registered references before it is committed: deleting a referenced
+        document triggers the ``on_delete`` behaviour (``RESTRICT`` rejects
+        the operation, ``SET_NULL`` nulls the referencing field, ``CASCADE``
+        deletes the referencing document), and writes that would introduce
+        a reference to a non-existing document are rejected. A field value
+        of ``None`` (or a missing field) means "no reference".
+
+        :param table: the name of the table holding the referencing field
+        :param field: the document field storing the target ``doc_id``
+        :param ref_table: the name of the table the field points to
+        :param on_delete: one of ``'restrict'``, ``'set_null'`` or
+                          ``'cascade'``
+        :returns: the registered :class:`Reference`
+        :raises ReferentialIntegrityError: if the current database state
+            already violates the new constraint
+        """
+        reference = Reference(table, field, ref_table, on_delete)
+
+        if reference in self._references:
+            return reference
+
+        # Make sure the current state satisfies the new constraint
+        validate_references(
+            self.storage.read() or {},
+            self._references + [reference],
+        )
+
+        self._references.append(reference)
+
+        return reference
+
+    def drop_reference(self, table: str, field: str, ref_table: str) -> None:
+        """
+        Remove a previously registered referential constraint.
+
+        :param table: the name of the table holding the referencing field
+        :param field: the document field storing the target ``doc_id``
+        :param ref_table: the name of the table the field points to
+        """
+        self._references = [
+            reference for reference in self._references
+            if not (
+                reference.table == table
+                and reference.field == field
+                and reference.ref_table == ref_table
+            )
+        ]
+
     def drop_tables(self) -> None:
         """
         Drop all tables from the database. **CANNOT BE REVERSED!**
@@ -177,13 +259,14 @@ class TinyDB(TableBase):
         """
         Drop a specific table from the database. **CANNOT BE REVERSED!**
 
+        Dropping a table deletes all its documents, so the registered
+        referential constraints are enforced the same way as for any other
+        deletion: depending on their ``on_delete`` behaviour, references to
+        the dropped table's documents either reject the operation, are set
+        to ``None`` or delete the referencing documents.
+
         :param name: The name of the table to drop.
         """
-
-        # If the table is currently opened, we need to forget the table class
-        # instance
-        if name in self._tables:
-            del self._tables[name]
 
         data = self.storage.read()
 
@@ -195,11 +278,28 @@ class TinyDB(TableBase):
         if name not in data:
             return
 
-        # Remove the table from the data dict
-        del data[name]
+        if self._references:
+            # Validate the complete candidate state (without the dropped
+            # table) on a deep copy, so a constraint violation leaves the
+            # storage untouched and the final state is written exactly once
+            candidate = copy.deepcopy(data)
+            del candidate[name]
 
-        # Store the updated data back to the storage
-        self.storage.write(data)
+            # May raise ReferentialIntegrityError, aborting the drop
+            enforce_references(data, candidate, self._references)
+
+            self.storage.write(candidate)
+        else:
+            # Remove the table from the data dict
+            del data[name]
+
+            # Store the updated data back to the storage
+            self.storage.write(data)
+
+        # If the table is currently opened, we need to forget the table class
+        # instance
+        if name in self._tables:
+            del self._tables[name]
 
     @property
     def storage(self) -> Storage:

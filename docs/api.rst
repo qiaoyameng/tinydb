@@ -56,6 +56,18 @@ details.
     :private-members:
     :member-order: bysource
 
+``tinydb.references``
+---------------------
+
+.. autoclass:: tinydb.references.Reference
+    :members:
+
+.. autoexception:: tinydb.references.ReferentialIntegrityError
+
+.. autodata:: tinydb.references.RESTRICT
+.. autodata:: tinydb.references.SET_NULL
+.. autodata:: tinydb.references.CASCADE
+
 .. _table_api:
 
 ``tinydb.table``

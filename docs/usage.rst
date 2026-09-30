@@ -610,6 +610,41 @@ to the ``table(...)`` function:
    long-running applications that use ``lambda`` functions as a test function
    may experience memory leaks.
 
+Referential Constraints
+-----------------------
+
+TinyDB can optionally enforce referential constraints between tables. A
+reference declares that a field of the documents in one table stores the
+``doc_id`` of a document in another (or the same) table:
+
+>>> db.add_reference('books', 'author_id', 'authors', on_delete='cascade')
+
+Here ``books.author_id`` points to a document in ``authors``. A field
+value of ``None`` (or a missing field) means "no reference" and is always
+allowed. Every write operation validates the complete candidate state
+against all registered references before it is committed, so a violated
+constraint aborts the whole operation and the storage is never left with
+a partial result. The ``on_delete`` behaviour controls what happens when
+a referenced document is deleted (including deletions via ``truncate()``
+and ``drop_table()``):
+
+- ``'restrict'`` (the default) rejects the operation,
+- ``'set_null'`` sets the referencing field to ``None``,
+- ``'cascade'`` deletes the referencing document, cascading over multiple
+  levels and terminating on reference cycles.
+
+Inserting or updating a document so that it references a non-existing
+document is rejected, while documents inserted in the same
+``insert_multiple()`` batch may reference each other:
+
+>>> db.table('books').insert({'title': 'Unknown', 'author_id': 999})
+Traceback (most recent call last):
+...
+tinydb.references.ReferentialIntegrityError: Document ... references ...
+
+Use ``db.drop_reference(table, field, ref_table)`` to remove a constraint
+and ``db.references`` to inspect the registered ones.
+
 Storage & Middleware
 --------------------
 

@@ -3,6 +3,7 @@ This module implements tables, the central place for accessing and manipulating
 data in TinyDB.
 """
 
+import copy
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from typing import (
     NoReturn,
@@ -13,6 +14,7 @@ from typing import (
 )
 
 from .queries import QueryLike
+from .references import enforce_references
 from .storages import Storage
 from .utils import LRUCache
 
@@ -106,6 +108,11 @@ class Table:
         self._name = name
         self._query_cache: LRUCache[QueryLike, list[Document]] \
             = self.query_cache_class(capacity=cache_size)
+
+        # The database instance that manages this table, if any. This is
+        # set by ``TinyDB.table()`` and gives access to the referential
+        # constraints registered on the database.
+        self._database = None
 
         self._next_id: Optional[int] = None
         if persist_empty:
@@ -771,6 +778,19 @@ class Table:
 
         return next_id
 
+    def _get_references(self):
+        """
+        Return the referential constraints registered on the database that
+        manages this table, or an empty tuple if there is none.
+        """
+
+        database = self.__dict__.get('_database')
+
+        if database is None:
+            return ()
+
+        return database.references
+
     def _read_table(self) -> dict[str, Mapping]:
         """
         Read the table data from the underlying storage.
@@ -816,6 +836,20 @@ class Table:
             # The database is empty
             tables = {}
 
+        references = self._get_references()
+
+        if references:
+            # Referential constraints are registered: the whole operation
+            # (the updater below as well as the constraint enforcement)
+            # works on a deep copy of the database state. This way, a
+            # constraint violation cannot leak partially applied changes
+            # into the storage's own data structures -- the storage is
+            # written exactly once, with the validated final state.
+            before = tables
+            tables = copy.deepcopy(tables)
+        else:
+            before = None
+
         try:
             raw_table = tables[self.name]
         except KeyError:
@@ -837,10 +871,18 @@ class Table:
         # Convert the document IDs back to strings.
         # This is required as some storages (most notably the JSON file format)
         # don't support IDs other than strings.
-        tables[self.name] = {
+        new_table = {
             str(doc_id): doc
             for doc_id, doc in table.items()
         }
+
+        tables[self.name] = new_table
+
+        if references:
+            # Validate the complete candidate state before committing
+            # anything. May raise ReferentialIntegrityError, aborting the
+            # write; the storage still holds the previous consistent state.
+            enforce_references(before, tables, references)
 
         # Write the newly updated data back to the storage
         self._storage.write(tables)
