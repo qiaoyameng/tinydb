@@ -616,7 +616,8 @@ Storage & Middleware
 Storage Types
 .............
 
-TinyDB comes with two storage types: JSON and in-memory. By
+TinyDB comes with three storage types: regular JSON, journaled JSON and
+in-memory. By
 default TinyDB stores its data in JSON files so you have to specify the path
 where to store it:
 
@@ -642,6 +643,39 @@ To use the in-memory storage, use:
     ``JSONStorage`` forwards ``**kwargs`` to ``json.dumps``. **Never** pass
     user-controlled values for callable arguments (e.g. ``default`` or
     ``cls``) as they are executed in-process on every write operation.
+
+Journaled JSON Storage
+^^^^^^^^^^^^^^^^^^^^^^
+
+A process may be killed (or the machine may lose power) while TinyDB is in
+the middle of writing the data file. Because :class:`~tinydb.storages.JSONStorage`
+writes the JSON file in place, this can leave behind a truncated,
+half-written file. :class:`~tinydb.storages.JournalStorage` is a drop-in
+replacement that prevents this by writing a checksummed write-ahead journal
+before replacing the main data file:
+
+>>> from tinydb.storages import JournalStorage
+>>> db = TinyDB('db.json', storage=JournalStorage)
+
+Every write is flushed and ``fsync``'ed before it replaces the main data file;
+durability does not depend on calling ``close()``. When a database is opened,
+any pending journal is recovered:
+
+- a complete, checksum-valid commit is installed, so the last complete commit
+  is visible after reopening,
+- a truncated tail, a missing commit boundary or a checksum mismatch causes
+  the journal to be discarded and the previous data file to be kept.
+
+Recovery is deterministic and idempotent -- reopening the file multiple
+times has the same result as reopening it once. After a crash during a write
+the database therefore contains either the old version or the complete new
+version, but never a half-written JSON file.
+
+.. warning::
+    :class:`~tinydb.storages.JournalStorage` does not perform file locking.
+    A given data file must be written by only one process (and one storage
+    instance) at a time. Concurrent readers are fine as long as no writer is
+    active.
 
 To modify the default storage for all ``TinyDB`` instances, set the
 ``default_storage_class`` class variable:

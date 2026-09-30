@@ -19,7 +19,8 @@ At the center is :class:`~tinydb.database.TinyDB`, which owns a
 :class:`~tinydb.queries.QueryInstance`.
 
 Persistence is handled by subclasses of :class:`~tinydb.storages.Storage` such
-as :class:`~tinydb.storages.JSONStorage` and
+as :class:`~tinydb.storages.JSONStorage`,
+:class:`~tinydb.storages.JournalStorage` and
 :class:`~tinydb.storages.MemoryStorage`. You can wrap a storage with
 :class:`~tinydb.middlewares.Middleware` implementations like
 :class:`~tinydb.middlewares.CachingMiddleware` to change how reads and writes
@@ -105,7 +106,7 @@ details.
 ------------------
 
 .. automodule:: tinydb.storages
-    :members: JSONStorage, MemoryStorage
+    :members: JSONStorage, JournalStorage, MemoryStorage
     :special-members:
     :exclude-members: __weakref__
 

@@ -19,6 +19,21 @@ see `semver.org <http://semver.org/>`_
           syntax (``Query()['some']['nested']['field']``) that will
           not break even when new methods are added to the ``Query`` API.
 
+v4.9.1 (unreleased)
+^^^^^^^^^^^^^^^^^^^
+
+- New: :class:`~tinydb.storages.JournalStorage`, an optional journaled JSON
+  storage that keeps the data file consistent when a process is killed or the
+  machine loses power while a write is in progress. Each write is stored in a
+  checksummed write-ahead journal (``<path>.journal``) with an explicit
+  commit boundary before the main data file is atomically replaced; every
+  step is flushed and ``fsync``'ed as part of ``write()``, not only on
+  ``close()``. On reopen, the last complete commit is restored, while
+  truncated tails, missing commit records and checksum mismatches cause the
+  journal to be discarded, leaving the previous data file intact. Recovery
+  is deterministic and idempotent. The storage does not perform file locking:
+  a given file may only have a single writer at a time.
+
 v4.9.0 (2026-08-06)
 ^^^^^^^^^^^^^^^^^^^
 
