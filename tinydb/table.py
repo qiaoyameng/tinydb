@@ -3,8 +3,12 @@ This module implements tables, the central place for accessing and manipulating
 data in TinyDB.
 """
 
+import copy
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
+import hashlib
+import json
 from typing import (
+    Any,
     NoReturn,
     Optional,
     Union,
@@ -12,11 +16,14 @@ from typing import (
     overload
 )
 
+from .indexes import CompositeIndex, IndexPlan, _missing
 from .queries import QueryLike
 from .storages import Storage
 from .utils import LRUCache
 
-__all__ = ('Document', 'Table')
+__all__ = ('Document', 'Table', 'CompositeIndex')
+
+IndexDefinitions = Optional[Mapping[str, Union[str, Iterable[str]]]]
 
 
 class Document(dict):
@@ -69,6 +76,7 @@ class Table:
     :param name: The table name
     :param cache_size: Maximum capacity of query cache
     :param persist_empty: Store new table even with no operations on it
+    :param indexes: Composite indexes to create for this table
     """
 
     #: The class used to represent documents
@@ -96,7 +104,8 @@ class Table:
         storage: Storage,
         name: str,
         cache_size: int = default_query_cache_capacity,
-        persist_empty: bool = False
+        persist_empty: bool = False,
+        indexes: IndexDefinitions = None,
     ):
         """
         Create a table instance.
@@ -108,6 +117,13 @@ class Table:
             = self.query_cache_class(capacity=cache_size)
 
         self._next_id: Optional[int] = None
+        self._indexes: dict[str, CompositeIndex] = {}
+        self._index_revision = 0
+        self._index_metadata_dirty = False
+        self._pending_index_definitions = dict(indexes or {})
+        self._indexes_loaded = not self._pending_index_definitions
+        self._index_check_pending = True
+
         if persist_empty:
             self._update_table(lambda table: table.clear())
 
@@ -264,14 +280,9 @@ class Table:
         if cached_results is not None:
             return cached_results[:]
 
-        # Perform the search by applying the query to all documents.
-        # Then, only if the document matches the query, convert it
-        # to the document class and document ID class.
-        docs = [
-            self.document_class(doc, self.document_id_class(doc_id))
-            for doc_id, doc in self._read_table().items()
-            if cond(doc)
-        ]
+        self._ensure_indexes_loaded()
+        plan = self._index_plan(cond)
+        docs = self._search_with_plan(cond, plan)
 
         # Only cache cacheable queries.
         #
@@ -293,6 +304,29 @@ class Table:
             self._query_cache[cond] = docs[:]
 
         return docs
+
+    def _search_scan(self, cond: QueryLike) -> list[Document]:
+        return [
+            self.document_class(doc, self.document_id_class(doc_id))
+            for doc_id, doc in self._read_table().items()
+            if cond(doc)
+        ]
+
+    def _search_with_plan(
+            self, cond: QueryLike, plan: Optional[IndexPlan]) -> list[Document]:
+        table = self._read_table()
+        if plan is None:
+            candidate_ids = None
+        else:
+            candidate_ids = plan.candidate_ids()
+
+        return [
+            self.document_class(doc, self.document_id_class(doc_id))
+            for doc_id, doc in table.items()
+            if (candidate_ids is None
+                or self.document_id_class(doc_id) in candidate_ids)
+            and cond(doc)
+        ]
 
     @overload
     def get(self) -> NoReturn: ...
@@ -354,6 +388,7 @@ class Table:
         table = self._read_table()
 
         if doc_id is not None:
+            self._ensure_indexes_loaded()
             # Retrieve a document specified by its ID
             raw_doc = table.get(str(doc_id), None)
 
@@ -364,6 +399,7 @@ class Table:
             return self.document_class(raw_doc, doc_id)
 
         elif doc_ids is not None:
+            self._ensure_indexes_loaded()
             # Filter the table by extracting out all those documents which
             # have doc id specified in the doc_id list.
 
@@ -379,6 +415,7 @@ class Table:
             ]
 
         elif cond is not None:
+            self._ensure_indexes_loaded()
             # Find a document specified by a query
             # The trailing underscore in doc_id_ is needed so MyPy
             # doesn't think that `doc_id_` (which is a string) needs
@@ -717,6 +754,265 @@ class Table:
 
         self._query_cache.clear()
 
+    def _reset_indexes(self) -> None:
+        self._indexes.clear()
+        self._index_revision = 0
+        self._index_metadata_dirty = False
+        self._pending_index_definitions = {}
+        self._indexes_loaded = True
+        self._index_check_pending = False
+
+    def indexes(self) -> dict[str, CompositeIndex]:
+        """
+        Get the table's composite indexes.
+        """
+
+        self._ensure_indexes_loaded()
+        return dict(self._indexes)
+
+    def add_index(
+            self,
+            fields: Union[str, Iterable[str]],
+            name: Optional[str] = None) -> str:
+        """
+        Add and build a composite index.
+        """
+
+        self._ensure_indexes_loaded()
+        normalized = self._normalize_index_fields(fields)
+        index_name = name or 'idx_' + '_'.join(normalized)
+        if not index_name:
+            raise ValueError('Index name must not be empty')
+
+        existing = self._indexes.get(index_name)
+        if existing is not None and existing.fields != normalized:
+            raise ValueError(f'Index {index_name!r} already exists')
+        if existing is not None:
+            return index_name
+
+        index = CompositeIndex(normalized)
+        for doc_id, document in self._read_table().items():
+            index.add(self._index_doc_id(doc_id),
+                      self._index_values(document, index))
+        self._indexes[index_name] = index
+        self._index_revision += 1
+
+        tables = self._storage.read()
+        if tables is None:
+            tables = {}
+        self._write_index_metadata(tables, self._read_table())
+        self._storage.write(tables)
+        self.clear_cache()
+        return index_name
+
+    def drop_index(self, name: str) -> None:
+        """
+        Remove a composite index.
+        """
+
+        self._ensure_indexes_loaded()
+        if name not in self._indexes:
+            return
+
+        del self._indexes[name]
+        tables = self._storage.read() or {}
+        self._write_index_metadata(tables, self._read_table())
+        self._storage.write(tables)
+        self.clear_cache()
+
+    def rebuild_index(self, name: str) -> None:
+        """
+        Rebuild a composite index from the current table data.
+        """
+
+        self._ensure_indexes_loaded()
+        index = self._indexes[name]
+        rebuilt = CompositeIndex(index.fields)
+        for doc_id, document in self._read_table().items():
+            rebuilt.add(self._index_doc_id(doc_id),
+                        self._index_values(document, rebuilt))
+        self._indexes[name] = rebuilt
+        self._index_revision += 1
+
+        tables = self._storage.read() or {}
+        self._write_index_metadata(tables, self._read_table())
+        self._storage.write(tables)
+        self.clear_cache()
+
+    def _ensure_indexes_loaded(
+            self, tables: Optional[dict[str, Any]] = None) -> None:
+        if self._indexes_loaded and not self._index_check_pending:
+            return
+        if tables is None and (
+                self._index_check_pending or self._pending_index_definitions):
+            tables = self._storage.read() or {}
+        self._load_indexes(self._pending_index_definitions, tables)
+        self._indexes_loaded = True
+        self._index_check_pending = False
+
+    def _load_indexes(
+            self,
+            definitions: Mapping[str, Union[str, Iterable[str]]],
+            tables: Optional[dict[str, Any]] = None):
+        if tables is None:
+            tables = self._storage.read() or {}
+
+        metadata = self._index_metadata_from_tables(tables)
+        raw_table = tables.get(self.name, {})
+        table_metadata = (tables.get('__tinydb_indexes__') or {}).get(self.name, {})
+        if not isinstance(table_metadata, Mapping):
+            table_metadata = {}
+        table_revision = table_metadata.get('revision')
+        table_checksum = table_metadata.get('checksum')
+        revisions = []
+
+        configured = {
+            name: self._normalize_index_fields(fields)
+            for name, fields in definitions.items()
+        }
+        for name, fields in configured.items():
+            entry = metadata.get(name)
+            if entry is not None and tuple(entry.get('fields', ())) == fields:
+                if isinstance(table_revision, int):
+                    revisions.append(table_revision)
+            else:
+                self._index_metadata_dirty = True
+
+        for name, entry in metadata.items():
+            fields = entry.get('fields')
+            if not isinstance(fields, list) or not all(
+                    isinstance(field, str) for field in fields):
+                self._index_metadata_dirty = True
+                continue
+
+            try:
+                index = CompositeIndex(tuple(fields))
+            except ValueError:
+                self._index_metadata_dirty = True
+                continue
+
+            for doc_id, document in raw_table.items():
+                index.add(self._index_doc_id(doc_id),
+                          self._index_values(document, index))
+            self._indexes[name] = index
+
+            if isinstance(table_revision, int):
+                self._index_revision = table_revision
+            if not isinstance(table_checksum, str) or \
+                    table_checksum != self._index_checksum(raw_table):
+                self._index_metadata_dirty = True
+
+        for name, fields in configured.items():
+            existing = self._indexes.get(name)
+            if existing is None:
+                index = CompositeIndex(fields)
+                for doc_id, document in raw_table.items():
+                    index.add(self._index_doc_id(doc_id),
+                              self._index_values(document, index))
+                self._indexes[name] = index
+            elif existing.fields != fields:
+                self.rebuild_index(name)
+
+        if revisions:
+            self._index_revision = max(revisions)
+
+        if self._index_metadata_dirty and self._indexes:
+            self._index_revision += 1
+            if self.name not in tables:
+                tables[self.name] = {}
+            normalized_table = {
+                self._index_doc_id(doc_id): document
+                for doc_id, document in tables[self.name].items()
+            }
+            self._write_index_metadata(tables, normalized_table)
+            self._storage.write(tables)
+
+    @staticmethod
+    def _flatten_and(query: Any) -> Optional[list[tuple]]:
+        if not isinstance(query, tuple) or not query:
+            return None
+        if query[0] == 'and':
+            left = Table._flatten_and(query[1])
+            right = Table._flatten_and(query[2])
+            if left is None or right is None:
+                return None
+            return left + right
+        if query[0] in ('or', 'not'):
+            return None
+        if query[0] == 'cmp':
+            return [query]
+        return None
+
+    def _index_plan(self, cond: QueryLike) -> Optional[IndexPlan]:
+        self._ensure_indexes_loaded()
+        expression = getattr(cond, '_query', None)
+        comparisons = self._flatten_and(expression)
+        if comparisons is None:
+            return None
+
+        predicates_by_field: dict[str, list[tuple[str, Any]]] = {}
+        for _, operator, path, value in comparisons:
+            if len(path) != 1 or not isinstance(path[0], str):
+                return None
+            predicates_by_field.setdefault(path[0], []).append(
+                (operator, value)
+            )
+
+        for index in self._indexes.values():
+            equality_values = []
+            range_predicate = None
+            valid = True
+            covered_fields = set()
+
+            for position, field in enumerate(index.fields):
+                predicates = predicates_by_field.get(field, [])
+
+                if position == len(index.fields) - 1:
+                    if not predicates:
+                        break
+                    equality_predicates = [
+                        predicate for predicate in predicates
+                        if predicate[0] == '=='
+                    ]
+                    range_predicates = [
+                        predicate for predicate in predicates
+                        if predicate[0] in ('<', '<=', '>', '>=')
+                    ]
+                    if len(equality_predicates) == 1 and not range_predicates:
+                        equality_values.append(equality_predicates[0][1])
+                    elif not equality_predicates and len(range_predicates) == 1:
+                        range_predicate = range_predicates[0]
+                    else:
+                        valid = False
+                        break
+                    covered_fields.add(field)
+                else:
+                    if not predicates:
+                        break
+                    if len(predicates) != 1 or predicates[0][0] != '==':
+                        valid = False
+                        break
+                    equality_values.append(predicates[0][1])
+                    covered_fields.add(field)
+
+            if not valid:
+                continue
+
+            if set(predicates_by_field) != covered_fields:
+                valid = False
+            if not valid:
+                continue
+
+            return IndexPlan(
+                index=index,
+                equality_values=tuple(equality_values),
+                range_value=None if range_predicate is None else (
+                    range_predicate[0], range_predicate[1]
+                ),
+            )
+
+        return None
+
     def __len__(self):
         """
         Count the total number of documents in this table.
@@ -782,6 +1078,8 @@ class Table:
 
         # Retrieve the tables from the storage
         tables = self._storage.read()
+        if self._index_check_pending:
+            self._prime_index_check(tables)
 
         if tables is None:
             # The database is empty
@@ -795,6 +1093,13 @@ class Table:
             return {}
 
         return table
+
+    def _prime_index_check(self, tables: Optional[dict[str, Any]]) -> None:
+        if not self._pending_index_definitions:
+            root = (tables or {}).get('__tinydb_indexes__')
+            if not isinstance(root, Mapping) or self.name not in root:
+                self._indexes_loaded = True
+                self._index_check_pending = False
 
     def _update_table(self, updater: Callable[[dict[int, Mapping]], None]):
         """
@@ -811,6 +1116,7 @@ class Table:
         """
 
         tables = self._storage.read()
+        self._ensure_indexes_loaded(tables)
 
         if tables is None:
             # The database is empty
@@ -831,8 +1137,12 @@ class Table:
             for doc_id, doc in raw_table.items()
         }
 
+        old_snapshots = self._index_snapshots(table)
+
         # Perform the table update operation
         updater(table)
+
+        self._update_indexes(table, old_snapshots)
 
         # Convert the document IDs back to strings.
         # This is required as some storages (most notably the JSON file format)
@@ -841,9 +1151,174 @@ class Table:
             str(doc_id): doc
             for doc_id, doc in table.items()
         }
+        self._write_index_metadata(tables, table)
 
         # Write the newly updated data back to the storage
         self._storage.write(tables)
 
         # Clear the query cache, as the table contents have changed
         self.clear_cache()
+
+    @staticmethod
+    def _normalize_index_fields(
+            fields: Union[str, Iterable[str]]) -> tuple[str, ...]:
+        if isinstance(fields, str):
+            return (fields,)
+        normalized = tuple(fields)
+        if not normalized or any(not isinstance(field, str) or not field
+                                 for field in normalized):
+            raise ValueError('Index fields must be non-empty strings')
+        return normalized
+
+    def _index_doc_id(self, doc_id: Any) -> int:
+        return self.document_id_class(doc_id)
+
+    def _read_index_metadata(self) -> dict[str, Any]:
+        return self._index_metadata_from_tables(self._storage.read() or {})
+
+    def _index_metadata_from_tables(
+            self, tables: Mapping[str, Any]) -> dict[str, Any]:
+        root = tables.get('__tinydb_indexes__', {})
+        if not isinstance(root, Mapping):
+            return {}
+        metadata = root.get(self.name)
+        if not isinstance(metadata, Mapping):
+            return {}
+        index_entries = metadata.get('indexes')
+        if not isinstance(index_entries, Mapping):
+            return {}
+        result = {}
+        for name, entry in index_entries.items():
+            if isinstance(name, str) and isinstance(entry, Mapping):
+                result[name] = {
+                    'fields': entry.get('fields'),
+                    'revision': metadata.get('revision'),
+                    'checksum': metadata.get('checksum'),
+                }
+        return result
+
+    def _index_snapshots(
+            self, table: Mapping[int, Mapping]) -> dict[int, dict[str, tuple]]:
+        snapshots: dict[int, dict[str, tuple]] = {}
+        for raw_id, document in table.items():
+            doc_id = self._index_doc_id(raw_id)
+            document_snapshots = {}
+            for name, index in self._indexes.items():
+                values = []
+                for field in index.fields:
+                    try:
+                        value = document[field]
+                    except (KeyError, TypeError):
+                        value = _missing
+                    try:
+                        values.append(copy.deepcopy(value))
+                    except (TypeError, ValueError, RecursionError):
+                        values.append(value)
+                document_snapshots[name] = tuple(values)
+            snapshots[doc_id] = document_snapshots
+        return snapshots
+
+    @staticmethod
+    def _index_values(document: Mapping, index: CompositeIndex) -> tuple[Any, ...]:
+        values = []
+        for field in index.fields:
+            try:
+                values.append(document[field])
+            except (KeyError, TypeError):
+                values.append(_missing)
+        return tuple(values)
+
+    @staticmethod
+    def _index_tuple_changed(old: tuple[Any, ...], new: tuple[Any, ...]) -> bool:
+        if old is new:
+            return False
+        if len(old) != len(new):
+            return True
+        for old_value, new_value in zip(old, new):
+            if old_value is _missing != (new_value is _missing):
+                return True
+            if old_value is _missing:
+                continue
+            try:
+                different = old_value != new_value
+            except TypeError:
+                different = True
+            if different:
+                return True
+        return False
+
+    def _update_indexes(
+            self,
+            table: Mapping[int, Mapping],
+            old_snapshots: Mapping[int, Mapping[str, tuple]]) -> None:
+        if not self._indexes:
+            return
+
+        affected_ids = {
+            self._index_doc_id(doc_id)
+            for doc_id in set(old_snapshots) | set(table)
+        }
+        for doc_id in affected_ids:
+            for name, index in self._indexes.items():
+                old_values = old_snapshots.get(
+                    doc_id, {}
+                ).get(name, (_missing,) * len(index.fields))
+                new_document = table.get(doc_id)
+                new_values = (
+                    self._index_values(new_document, index)
+                    if new_document is not None
+                    else (_missing,) * len(index.fields)
+                )
+                if self._index_tuple_changed(old_values, new_values):
+                    index.remove(doc_id, old_values)
+                    index.add(doc_id, new_values)
+
+        self._index_revision += 1
+        self._index_metadata_dirty = True
+
+    def _index_checksum(self, table: Mapping[int, Mapping]) -> str:
+        payload = []
+        for raw_id in sorted(table, key=int):
+            doc_id = self._index_doc_id(raw_id)
+            document = table[raw_id]
+            for name, index in self._indexes.items():
+                values = self._index_values(document, index)
+                payload.append({
+                    'doc_id': doc_id,
+                    'index': name,
+                    'values': [
+                        None if value is _missing else repr(value)
+                        for value in values
+                    ],
+                    'missing': [value is _missing for value in values],
+                })
+        encoded = json.dumps(
+            {'revision': self._index_revision, 'payload': payload},
+            ensure_ascii=False, separators=(',', ':'), sort_keys=True,
+            default=repr
+        )
+        return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+    def _write_index_metadata(
+            self, tables: dict[str, Any], table: Mapping[int, Mapping]) -> None:
+        root = tables.setdefault('__tinydb_indexes__', {})
+        if not isinstance(root, MutableMapping):
+            root = {}
+            tables['__tinydb_indexes__'] = root
+
+        if self._indexes:
+            root[self.name] = {
+                'revision': self._index_revision,
+                'checksum': self._index_checksum(table),
+                'indexes': {
+                    name: {'fields': list(index.fields)}
+                    for name, index in self._indexes.items()
+                },
+            }
+        elif isinstance(root.get(self.name), Mapping):
+            del root[self.name]
+
+        if not root:
+            tables.pop('__tinydb_indexes__', None)
+
+        self._index_metadata_dirty = False

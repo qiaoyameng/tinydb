@@ -90,6 +90,7 @@ class TinyDB(TableBase):
         """
 
         storage = kwargs.pop('storage', self.default_storage_class)
+        self._default_indexes = kwargs.pop('indexes', None)
 
         # Prepare the storage
         self._storage: Storage = storage(*args, **kwargs)
@@ -127,7 +128,12 @@ class TinyDB(TableBase):
         if name in self._tables:
             return self._tables[name]
 
-        table = self.table_class(self.storage, name, **kwargs)
+        table_kwargs = kwargs
+        if (name == self.default_table_name
+                and self._default_indexes is not None):
+            table_kwargs = {**kwargs, 'indexes': self._default_indexes}
+
+        table = self.table_class(self.storage, name, **table_kwargs)
         self._tables[name] = table
 
         return table
@@ -158,7 +164,10 @@ class TinyDB(TableBase):
         # so we need to consider this case to and return an empty set in this
         # case.
 
-        return set(self.storage.read() or {})
+        return {
+            name for name in (self.storage.read() or {})
+            if name != '__tinydb_indexes__'
+        }
 
     def drop_tables(self) -> None:
         """
@@ -168,6 +177,9 @@ class TinyDB(TableBase):
         # We drop all tables from this database by writing an empty dict
         # to the storage thereby returning to the initial state with no tables.
         self.storage.write({})
+
+        for table in self._tables.values():
+            table._reset_indexes()
 
         # After that we need to remember to empty the ``_tables`` dict, so we'll
         # create new table instances when a table is accessed again.
@@ -183,6 +195,7 @@ class TinyDB(TableBase):
         # If the table is currently opened, we need to forget the table class
         # instance
         if name in self._tables:
+            self._tables[name]._reset_indexes()
             del self._tables[name]
 
         data = self.storage.read()
@@ -191,12 +204,18 @@ class TinyDB(TableBase):
         if data is None:
             return
 
-        # The table does not exist, there's nothing to do
-        if name not in data:
+        index_metadata = data.get('__tinydb_indexes__')
+        if name not in data and not (
+                isinstance(index_metadata, dict) and name in index_metadata):
             return
 
         # Remove the table from the data dict
-        del data[name]
+        data.pop(name, None)
+
+        if isinstance(index_metadata, dict):
+            index_metadata.pop(name, None)
+            if not index_metadata:
+                data.pop('__tinydb_indexes__', None)
 
         # Store the updated data back to the storage
         self.storage.write(data)
