@@ -13,6 +13,7 @@ from typing import (
 )
 
 from .queries import QueryLike
+from .indexes import META_DOC_ID, IndexManager, IndexTransaction
 from .storages import Storage
 from .utils import LRUCache
 
@@ -108,8 +109,38 @@ class Table:
             = self.query_cache_class(capacity=cache_size)
 
         self._next_id: Optional[int] = None
+        self._index_manager: Optional[IndexManager] = None
+        self._operation_tables: Optional[dict[str, dict]] = None
+
         if persist_empty:
-            self._update_table(lambda table: table.clear())
+            self._update_table(lambda table, transaction: table.clear())
+
+    def _indexes(self) -> IndexManager:
+        if self._index_manager is None:
+            table, metadata, _ = self._load_stored_table()
+            self._index_manager = IndexManager(
+                self._storage,
+                self._name,
+                table,
+                metadata,
+                self.document_id_class
+            )
+        return self._index_manager
+
+    def create_index(self, *fields: Union[str, tuple[str, ...]]) -> None:
+        self._indexes().create_index(*fields)
+
+    def add_index(self, *fields: Union[str, tuple[str, ...]]) -> None:
+        self._indexes().create_index(*fields)
+
+    def drop_index(self, *fields: Union[str, tuple[str, ...]]) -> None:
+        self._indexes().drop_index(*fields)
+
+    def indexes(self) -> tuple:
+        return self._indexes().indexes()
+
+    def uses_index(self, cond: QueryLike) -> bool:
+        return self._indexes().plan_for(cond) is not None
 
     def __repr__(self):
         args = [
@@ -159,7 +190,7 @@ class Table:
             doc_id = self._get_next_id()
 
         # Now, we update the table and add the document
-        def updater(table: dict):
+        def updater(table: dict, transaction):
             if doc_id in table:
                 raise ValueError(f'Document with ID {str(doc_id)} '
                                  f'already exists')
@@ -168,6 +199,7 @@ class Table:
             # ``dict`` instance even if it was a different class that
             # implemented the ``Mapping`` interface
             table[doc_id] = dict(document)
+            transaction.insert(doc_id)
 
         # See below for details on ``Table._update``
         self._update_table(updater)
@@ -183,7 +215,7 @@ class Table:
         """
         doc_ids = []
 
-        def updater(table: dict):
+        def updater(table: dict, transaction):
             for document in documents:
 
                 # Make sure the document implements the ``Mapping`` interface
@@ -204,6 +236,7 @@ class Table:
                     doc_id = document.doc_id
                     doc_ids.append(doc_id)
                     table[doc_id] = dict(document)
+                    transaction.insert(doc_id)
                     # Same as insert(): don't reuse this ID for later
                     # auto-assigned documents in this batch.
                     self._next_id = None
@@ -224,6 +257,7 @@ class Table:
                 doc_id = self._get_next_id()
                 doc_ids.append(doc_id)
                 table[doc_id] = dict(document)
+                transaction.insert(doc_id)
 
         # See below for details on ``Table._update``
         self._update_table(updater)
@@ -264,14 +298,26 @@ class Table:
         if cached_results is not None:
             return cached_results[:]
 
-        # Perform the search by applying the query to all documents.
-        # Then, only if the document matches the query, convert it
-        # to the document class and document ID class.
-        docs = [
-            self.document_class(doc, self.document_id_class(doc_id))
-            for doc_id, doc in self._read_table().items()
-            if cond(doc)
-        ]
+        table = self._read_table()
+        index_manager = self._indexes()
+        index_plan = index_manager.plan_for(cond)
+
+        if index_plan is not None:
+            candidate_ids = index_manager.lookup(index_plan)
+            docs = [
+                self.document_class(doc, self.document_id_class(doc_id))
+                for doc_id, doc in table.items()
+                if doc_id in candidate_ids and cond(doc)
+            ]
+        else:
+            # Perform the search by applying the query to all documents.
+            # Then, only if the document matches the query, convert it
+            # to the document class and document ID class.
+            docs = [
+                self.document_class(doc, self.document_id_class(doc_id))
+                for doc_id, doc in table.items()
+                if cond(doc)
+            ]
 
         # Only cache cacheable queries.
         #
@@ -355,7 +401,7 @@ class Table:
 
         if doc_id is not None:
             # Retrieve a document specified by its ID
-            raw_doc = table.get(str(doc_id), None)
+            raw_doc = table.get(doc_id, None)
 
             if raw_doc is None:
                 return None
@@ -369,7 +415,7 @@ class Table:
 
             # Since document IDs will be unique, we make it a set to ensure
             # constant time lookup
-            doc_ids_set = set(str(doc_id) for doc_id in doc_ids)
+            doc_ids_set = set(doc_id for doc_id in doc_ids)
 
             # Now return the filtered documents in form of list
             return [
@@ -460,7 +506,7 @@ class Table:
             requested_ids = list(doc_ids)
             updated_ids: list[int] = []
 
-            def updater(table: dict):
+            def updater(table: dict, transaction):
                 # Filter to IDs that exist *before* performing any updates,
                 # so the operation is atomic: either every existing target is
                 # updated, or none is.
@@ -468,6 +514,7 @@ class Table:
                     doc_id for doc_id in requested_ids if doc_id in table
                 )
                 for doc_id in updated_ids:
+                    transaction.update(table, doc_id)
                     perform_update(table, doc_id)
 
             # Perform the update operation (see _update_table for details)
@@ -481,7 +528,7 @@ class Table:
             # Collect affected doc_ids
             updated_ids = []
 
-            def updater(table: dict):
+            def updater(table: dict, transaction):
                 _cond = cast(QueryLike, cond)
 
                 # We need to convert the keys iterator to a list because
@@ -497,6 +544,7 @@ class Table:
                         updated_ids.append(doc_id)
 
                         # Perform the update (see above)
+                        transaction.update(table, doc_id)
                         perform_update(table, doc_id)
 
             # Perform the update operation (see _update_table for details)
@@ -509,13 +557,14 @@ class Table:
 
             updated_ids = []
 
-            def updater(table: dict):
+            def updater(table: dict, transaction):
                 # Process all documents
                 for doc_id in list(table.keys()):
                     # Add ID to list of updated documents
                     updated_ids.append(doc_id)
 
                     # Perform the update (see above)
+                    transaction.update(table, doc_id)
                     perform_update(table, doc_id)
 
             # Perform the update operation (see _update_table for details)
@@ -551,13 +600,14 @@ class Table:
         # Collect affected doc_ids
         updated_ids = []
 
-        def updater(table: dict):
+        def updater(table: dict, transaction):
             # We need to convert the keys iterator to a list because
             # we may remove entries from the ``table`` dict during
             # iteration and doing this without the list conversion would
             # result in an exception (RuntimeError: dictionary changed size
             # during iteration)
             for doc_id in list(table.keys()):
+                document_matched = False
                 for fields, cond in updates:
                     _cond = cast(QueryLike, cond)
 
@@ -566,6 +616,9 @@ class Table:
                     if _cond(table[doc_id]):
                         # Add ID to list of updated documents
                         updated_ids.append(doc_id)
+                        if not document_matched:
+                            transaction.update(table, doc_id)
+                            document_matched = True
 
                         # Perform the update (see above)
                         perform_update(fields, table, doc_id)
@@ -643,7 +696,7 @@ class Table:
             requested_ids = list(doc_ids)
             removed_ids: list[int] = []
 
-            def updater(table: dict):
+            def updater(table: dict, transaction):
                 # Filter to IDs that exist *before* performing any removals,
                 # so the operation is atomic: either every existing target is
                 # removed, or none is.
@@ -651,6 +704,7 @@ class Table:
                     doc_id for doc_id in requested_ids if doc_id in table
                 )
                 for doc_id in removed_ids:
+                    transaction.remove(table, doc_id)
                     del table[doc_id]
 
             # Perform the remove operation
@@ -664,7 +718,7 @@ class Table:
             # This updater function will be called with the table data
             # as its first argument. See ``Table._update`` for details on this
             # operation
-            def updater(table: dict):
+            def updater(table: dict, transaction):
                 # We need to convince MyPy (the static type checker) that
                 # the ``cond is not None`` invariant still holds true when
                 # the updater function is called
@@ -681,6 +735,7 @@ class Table:
                         removed_ids.append(doc_id)
 
                         # Remove document from the table
+                        transaction.remove(table, doc_id)
                         table.pop(doc_id)
 
             # Perform the remove operation
@@ -696,7 +751,11 @@ class Table:
         """
 
         # Update the table by resetting all data
-        self._update_table(lambda table: table.clear())
+        def updater(table: dict, transaction):
+            transaction.truncate()
+            table.clear()
+
+        self._update_table(updater)
 
         # Reset document ID counter
         self._next_id = None
@@ -771,7 +830,7 @@ class Table:
 
         return next_id
 
-    def _read_table(self) -> dict[str, Mapping]:
+    def _read_table(self) -> dict[int, Mapping]:
         """
         Read the table data from the underlying storage.
 
@@ -780,23 +839,51 @@ class Table:
         only one document for example.
         """
 
-        # Retrieve the tables from the storage
-        tables = self._storage.read()
-
-        if tables is None:
-            # The database is empty
-            return {}
-
         # Retrieve the current table's data
-        try:
-            table = tables[self.name]
-        except KeyError:
-            # The table does not exist yet, so it is empty
-            return {}
-
+        table, _, _ = self._load_stored_table()
         return table
 
-    def _update_table(self, updater: Callable[[dict[int, Mapping]], None]):
+    def _load_stored_table(
+            self,
+            tables: Optional[dict[str, dict]] = None
+    ) -> tuple[dict[int, Mapping], Optional[Mapping], Optional[dict[str, dict]]]:
+        if tables is None and self._operation_tables is not None:
+            tables = self._operation_tables
+        if tables is None:
+            tables = self._storage.read()
+
+        if tables is None:
+            if self._index_manager is None:
+                self._index_manager = IndexManager(
+                    self._storage,
+                    self._name,
+                    {},
+                    None,
+                    self.document_id_class
+                )
+            return {}, None, None
+
+        raw_table = tables.get(self._name, {})
+        metadata = raw_table.get(META_DOC_ID)
+        table = {
+            self.document_id_class(doc_id): doc
+            for doc_id, doc in raw_table.items()
+            if doc_id != META_DOC_ID
+        }
+        if self._index_manager is None:
+            self._index_manager = IndexManager(
+                self._storage,
+                self._name,
+                table,
+                metadata,
+                self.document_id_class
+            )
+        return table, metadata, tables
+
+    def _update_table(
+            self,
+            updater: Callable[[dict[int, Mapping], IndexTransaction], None]
+    ):
         """
         Perform a table update operation.
 
@@ -811,39 +898,35 @@ class Table:
         """
 
         tables = self._storage.read()
-
         if tables is None:
-            # The database is empty
             tables = {}
 
+        table, _, tables = self._load_stored_table(tables)
+        self._operation_tables = tables
+        transaction = self._indexes().transaction()
+
         try:
-            raw_table = tables[self.name]
-        except KeyError:
-            # The table does not exist yet, so it is empty
-            raw_table = {}
+            # Perform the table update operation
+            updater(table, transaction)
 
-        # Convert the document IDs to the document ID class.
-        # This is required as the rest of TinyDB expects the document IDs
-        # to be an instance of ``self.document_id_class`` but the storage
-        # might convert dict keys to strings.
-        table = {
-            self.document_id_class(doc_id): doc
-            for doc_id, doc in raw_table.items()
-        }
+            # Convert the document IDs back to strings.
+            # This is required as some storages (most notably the JSON file format)
+            # don't support IDs other than strings.
+            tables[self.name] = {
+                str(doc_id): doc
+                for doc_id, doc in table.items()
+            }
 
-        # Perform the table update operation
-        updater(table)
+            # Update indexes before serializing metadata so its digest sees
+            # exactly the documents being stored in this write.
+            transaction.commit(table)
 
-        # Convert the document IDs back to strings.
-        # This is required as some storages (most notably the JSON file format)
-        # don't support IDs other than strings.
-        tables[self.name] = {
-            str(doc_id): doc
-            for doc_id, doc in table.items()
-        }
+            self._indexes().attach_metadata(tables)
 
-        # Write the newly updated data back to the storage
-        self._storage.write(tables)
+            # Write the newly updated data back to the storage
+            self._storage.write(tables)
+        finally:
+            self._operation_tables = None
 
         # Clear the query cache, as the table contents have changed
         self.clear_cache()

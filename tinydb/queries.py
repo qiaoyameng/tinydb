@@ -70,7 +70,14 @@ class QueryInstance:
     instance can be used as a key in a dictionary.
     """
 
-    def __init__(self, test: Callable[[Mapping], bool], hashval: Optional[tuple]):
+    def __init__(
+            self,
+            test: Callable[[Mapping], bool],
+            hashval: Optional[tuple],
+            query_path: Optional[tuple[Union[str, Callable], ...]] = None,
+            query_op: Optional[str] = None,
+            query_rhs: Any = None,
+            children: Optional[tuple['QueryInstance', ...]] = None):
         self._test = test
         if hashval is not None:
             try:
@@ -80,6 +87,10 @@ class QueryInstance:
                 # fall back to uncacheable rather than crash on first use.
                 hashval = None
         self._hash = hashval
+        self._query_path = query_path
+        self._query_op = query_op
+        self._query_rhs = query_rhs
+        self._children: tuple['QueryInstance', ...] = children or ()
 
     def is_cacheable(self) -> bool:
         return self._hash is not None
@@ -118,7 +129,12 @@ class QueryInstance:
             hashval = ('and', frozenset([self._hash, other._hash]))
         else:
             hashval = None
-        return QueryInstance(lambda value: self(value) and other(value), hashval)
+        return QueryInstance(
+            lambda value: self(value) and other(value),
+            hashval,
+            query_op='and',
+            children=(self, other)
+        )
 
     def __or__(self, other: 'QueryInstance') -> 'QueryInstance':
         # We use a frozenset for the hash as the OR operation is commutative
@@ -128,11 +144,21 @@ class QueryInstance:
             hashval = ('or', frozenset([self._hash, other._hash]))
         else:
             hashval = None
-        return QueryInstance(lambda value: self(value) or other(value), hashval)
+        return QueryInstance(
+            lambda value: self(value) or other(value),
+            hashval,
+            query_op='or',
+            children=(self, other)
+        )
 
     def __invert__(self) -> 'QueryInstance':
         hashval = ('not', self._hash) if self.is_cacheable() else None
-        return QueryInstance(lambda value: not self(value), hashval)
+        return QueryInstance(
+            lambda value: not self(value),
+            hashval,
+            query_op='not',
+            children=(self,)
+        )
 
 
 class Query(QueryInstance):
@@ -216,7 +242,9 @@ class Query(QueryInstance):
             self,
             test: Callable[[Any], bool],
             hashval: tuple,
-            allow_empty_path: bool = False
+            allow_empty_path: bool = False,
+            query_op: Optional[str] = None,
+            query_rhs: Any = None
     ) -> QueryInstance:
         """
         Generate a query based on a test function that first resolves the query
@@ -245,7 +273,10 @@ class Query(QueryInstance):
 
         return QueryInstance(
             lambda value: runner(value),
-            (hashval if self.is_cacheable() else None)
+            (hashval if self.is_cacheable() else None),
+            query_path=self._path,
+            query_op=query_op,
+            query_rhs=query_rhs
         )
 
     def __eq__(self, rhs: Any):
@@ -258,7 +289,9 @@ class Query(QueryInstance):
         """
         return self._generate_test(
             lambda value: value == rhs,
-            ('==', self._path, freeze(rhs))
+            ('==', self._path, freeze(rhs)),
+            query_op='==',
+            query_rhs=rhs
         )
 
     def __ne__(self, rhs: Any):
@@ -284,7 +317,9 @@ class Query(QueryInstance):
         """
         return self._generate_test(
             lambda value: value < rhs,
-            ('<', self._path, rhs)
+            ('<', self._path, rhs),
+            query_op='<',
+            query_rhs=rhs
         )
 
     def __le__(self, rhs: Any) -> QueryInstance:
@@ -297,7 +332,9 @@ class Query(QueryInstance):
         """
         return self._generate_test(
             lambda value: value <= rhs,
-            ('<=', self._path, rhs)
+            ('<=', self._path, rhs),
+            query_op='<=',
+            query_rhs=rhs
         )
 
     def __gt__(self, rhs: Any) -> QueryInstance:
@@ -310,7 +347,9 @@ class Query(QueryInstance):
         """
         return self._generate_test(
             lambda value: value > rhs,
-            ('>', self._path, rhs)
+            ('>', self._path, rhs),
+            query_op='>',
+            query_rhs=rhs
         )
 
     def __ge__(self, rhs: Any) -> QueryInstance:
@@ -323,7 +362,9 @@ class Query(QueryInstance):
         """
         return self._generate_test(
             lambda value: value >= rhs,
-            ('>=', self._path, rhs)
+            ('>=', self._path, rhs),
+            query_op='>=',
+            query_rhs=rhs
         )
 
     def exists(self) -> QueryInstance:
